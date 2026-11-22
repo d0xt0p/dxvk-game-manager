@@ -181,6 +181,59 @@ def inspect_exe(path):
     return {'arch': pe.arch, 'hints': hints, 'imports': imports, 'warning': warning}
 
 
+def api_analysis(exe):
+    """Bounded static hints from the EXE and imported local engine DLLs.
+
+    Never load/execute a module. Never infer an active runtime renderer.
+    Skip replaceable graphics wrappers so an existing DXVK/mod installation
+    does not become circular evidence for which API the game uses.
+    """
+    exe = plain(exe)
+    result = inspect_exe(exe)
+    mapping = {'d3d8.dll': 'D3D8', 'd3d9.dll': 'D3D9', 'd3d10.dll': 'D3D10',
+               'd3d10_1.dll': 'D3D10', 'd3d10core.dll': 'D3D10', 'd3d11.dll': 'D3D11',
+               'd3d12.dll': 'D3D12', 'vulkan-1.dll': 'Vulkan', 'opengl32.dll': 'OpenGL'}
+    pending = [(exe, 0)]
+    visited, evidence, notes = set(), [], []
+    budget = 256 * 1024 * 1024
+    while pending and len(visited) < 24:
+        path, depth = pending.pop(0)
+        if str(path).lower() in visited:
+            continue
+        visited.add(str(path).lower())
+        try:
+            size = plain(path).stat().st_size
+            if size > min(LIMIT, budget):
+                notes.append(f'{path.name}: пропущен по ограничению размера.')
+                continue
+            budget -= size
+            image = PE(read_file(path))
+            if image.arch != result['arch']:
+                continue
+            imports = image.imports()
+        except (OSError, ManagerError) as e:
+            notes.append(f'{path.name}: {e}')
+            continue
+        for name in imports:
+            if name in mapping:
+                evidence.append({'api': mapping[name], 'file': path.name, 'import': name, 'depth': depth})
+            if depth >= 2 or name in NAMES or name in mapping or '/' in name or '\\' in name or ':' in name:
+                continue
+            local = exe.parent / name
+            if local.suffix.lower() == '.dll' and local.is_file():
+                pending.append((local, depth + 1))
+    if pending:
+        notes.append('Достигнут предел анализа: 24 файла или глубина 2.')
+    hints = sorted({e['api'] for e in evidence})
+    nearest = min((e['depth'] for e in evidence), default=None)
+    closest = {e['api'] for e in evidence if e['depth'] == nearest}
+    supported = [h for h in closest if h in DLLS]
+    result.update(hints=hints, evidence=evidence, notes=notes,
+                  suggested=supported[0] if len(closest) == 1 and len(supported) == 1 else None,
+                  scanned=len(visited))
+    return result
+
+
 def package_files(source, arch, api):
     """Read selected members only; never extract an untrusted archive to disk."""
     source = plain(source)
